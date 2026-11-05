@@ -50,6 +50,7 @@ const TEXTS = {
     sumCastTitle: "Reparto",
     dEpisodes: "Episodios",
     dSimilar: "Más como esto",
+    brMore: "Ver más",
     panelTitle: "Absolute Cinema",
     tabCopy: "Esta copia",
     tabSummary: "Resumen",
@@ -122,6 +123,7 @@ const TEXTS = {
     sumCastTitle: "Cast",
     dEpisodes: "Episodes",
     dSimilar: "More like this",
+    brMore: "See more",
     panelTitle: "Absolute Cinema",
     tabCopy: "This copy",
     tabSummary: "Summary",
@@ -1297,7 +1299,15 @@ const hero = (slides) => (slides.length === 1 ? slideNode(slides[0]) : {
   type: "PageView", key: "hero" + slides.length, autoPlayMs: 6000, children: slides.map(slideNode),
 });
 
-const rail = (r, key) => ({ type: "titleRail", key, title: r.title, ...(r.ref ? { ref: r.ref } : {}), items: r.items.map(withOpen), size: "medium" });
+const rail = (r, key) => ({
+  type: "Column", key, gap: 8, children: [
+    { type: "Row", key: key + "-h", crossAxisAlignment: "center", children: [
+      { type: "Text", style: "h4", flex: 1, text: r.title, textEn: r.title },
+      ...(r.ref ? [{ type: "TextButton", key: key + "-more", ...twin("brMore", "labelText"), onPressed: { go: { browse: { ref: r.ref, title: r.title } } } }] : []),
+    ] },
+    cardRow(r.items, key, "medium"),
+  ],
+});
 
 /** `data`: `{ slides, rails }` of the active tab, or null while it is not in. `pending`: a tab is still being fetched. */
 function browseView({ tab, data, pending, failed, device }) {
@@ -1369,12 +1379,12 @@ function searchView({ query, status, items, history, device }) {
     body.push({ type: "MaterialBanner", key: "searchFailed", role: "error", ...twin("brSearchFailed"), action: { ...twin("brRetry", "label"), onTap: "sretry" } });
   } else if (status === "done" && items) {
     if (items.length === 0) body.push({ type: "Text", ...twin("brNoResults"), color: "muted" });
-    else body.push({ type: "titleGrid", key: "results", columns: { compact: 3, expanded: 6 }, items: items.slice(0, SEARCH_CAP).map(withOpen) });
+    else body.push(cardGrid(items.slice(0, SEARCH_CAP), "results"));
   } else if (status !== "idle") {
     body.push(gridSkeleton());
   } else if (history.length > 0) {
     body.push({ type: "Text", ...twin("brSearchedBefore"), style: "h4" });
-    body.push({ type: "titleGrid", key: "history", columns: { compact: 3, expanded: 6 }, items: history.slice(0, SEARCH_CAP).map(withOpen) });
+    body.push(cardGrid(history.slice(0, SEARCH_CAP), "history"));
   }
   return {
     type: "Scaffold",
@@ -1398,8 +1408,20 @@ function searchView({ query, status, items, history, device }) {
 const DETAIL_MAX_EPISODES = 80;
 const DETAIL_CAST = 12;
 
-/** A card's `open`: the screen restarts with `args.open` and answers by pushing the page. A live channel has no page. */
-const withOpen = (c) => (c && c.kind !== "live" && typeof c.ref === "string" && c.ref.length < 1000 ? { ...c, open: { screen: { args: { open: c.ref } } } } : c);
+/**
+ * One poster card; a movie or a series opens its page through the screen's own `openTitle` event (the card's tap: Kino's row
+ * component cannot open a page of the plugin's own). A live channel keeps Kino's own tap.
+ */
+const cardNode = (c, size, scope) => ({
+  type: "titleCard", key: `${scope}-${c.id}`, size, item: c,
+  ...(c.kind !== "live" && typeof c.ref === "string" && c.ref.length < 1000 ? { onTap: { event: "openTitle", arg: c.ref } } : {}),
+});
+
+/** A horizontal row of poster cards under [key]. */
+const cardRow = (items, key, size) => ({ type: "SingleChildScrollView", key: key + "-s", direction: "horizontal", children: [{ type: "Row", key: key + "-r", gap: 12, children: items.map((c) => cardNode(c, size, key)) }] });
+
+/** A grid of poster cards. */
+const cardGrid = (items, key) => ({ type: "GridView", key, columns: { compact: 3, expanded: 6 }, children: items.map((c) => cardNode(c, "medium", key)) });
 
 /** The ids of a ref, in the shape `kino.meta` takes. */
 function idsOfRef(r) {
@@ -1556,7 +1578,10 @@ function detailView({ r, entry, season, device }) {
         : sectionTitle("dEpisodes"));
       for (const ep of d.episodes.filter((e) => e.s === shown).slice(0, DETAIL_MAX_EPISODES)) body.push(episodeRow(d, r, ep));
     }
-    if (d.similar.length) body.push({ type: "titleRail", key: "dsimilar", ...twin("dSimilar", "title"), items: d.similar.map(withOpen), size: "medium" });
+    if (d.similar.length) {
+      body.push(sectionTitle("dSimilar"));
+      body.push(cardRow(d.similar, "dsimilar", "small"));
+    }
   }
   return {
     type: "Scaffold", appBar,
@@ -1667,6 +1692,12 @@ function makeBrowse() {
       const open = route && route.args && typeof route.args.open === "string" ? route.args.open : "";
       if (open) { out.route = { push: "detail", params: { ref: open } }; out.state.season = null; }
       return out;
+    },
+    // A card of the list was tapped: its page goes over the list.
+    openTitle({ arg }) {
+      let ok = false;
+      try { ok = typeof arg === "string" && typeof JSON.parse(arg).k === "string"; } catch { ok = false; }
+      return ok ? { route: { push: "detail", params: { ref: arg } }, state: { season: null } } : null;
     },
     // The page's timer: loads the title once, then no timer.
     async dtick({ route }) {
