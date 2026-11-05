@@ -8,6 +8,7 @@ own configuration. Empty uses the basic setup, without any profile.
 
 | Kino | From |
 | --- | --- |
+| `screen` (Kino 0.9.74+) | The plugin's own home: one bar with the logo, the settings gear and search, tabs (Inicio, Cine, Series, Anime), a slider of featured titles and the addon's rows. An older Kino keeps the section below. |
 | `home` | Live channels plus the addon's first catalogs, in its order. |
 | `section` | Tabs Cine, Series, Anime (the addon's catalogs of each type) and En vivo; with no catalogs from the addon, TMDB rows and a Plataformas tab. |
 | `categories`, `browse` | Tiles for each platform and genre; "Ver más" with TMDB paging. |

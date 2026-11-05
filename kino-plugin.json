@@ -1,7 +1,7 @@
 {
   "id": "absolute-cinema",
   "name": "Absolute Cinema",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "apiVersion": 9,
   "entry": "plugin.js",
   "description": "Películas, series, anime y TV en vivo desde un addon de Absolute Cinema (protocolo de Stremio) con fuentes HTTP directas. Los títulos vienen de TMDB; el video, del addon.",
@@ -164,5 +164,40 @@
       "label": "Verificar conexión",
       "labelEn": "Check connection"
     }
-  ]
+  ],
+  "icon": "icon.png",
+  "theme": {
+    "accent": "#E0A526",
+    "onAccent": "#1A1610",
+    "background": "#0B0905",
+    "surface": "#1A1610",
+    "highlight": "#F5E6C4"
+  },
+  "enhancements": {
+    "14": {
+      "capabilities": [
+        "screen"
+      ],
+      "screen": {
+        "label": "Absolute Cinema",
+        "labelEn": "Absolute Cinema",
+        "icon": "movie",
+        "menuOpens": "screen",
+        "opensFrom": [
+          "menu",
+          "settings"
+        ],
+        "settingsButton": {
+          "label": "Abrir Absolute Cinema",
+          "labelEn": "Open Absolute Cinema"
+        },
+        "settingsIn": "screen"
+      }
+    },
+    "19": {
+      "capabilities": [
+        "screen"
+      ]
+    }
+  }
 }
