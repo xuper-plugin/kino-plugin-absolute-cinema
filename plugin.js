@@ -177,10 +177,20 @@ function isLiveType(type) {
 function normalizeManifest(m) {
   if (!m || typeof m !== "object" || !Array.isArray(m.catalogs)) throw kino.error("unavailable", "no catalogs", { userMessage: t("notStremio") });
   const catalogs = [];
+  const content = [];
+  const searches = [];
   for (const c of m.catalogs) {
-    if (!c || !c.id || !c.type || !isLiveType(String(c.type))) continue;
+    if (!c || !c.id || !c.type) continue;
     const extra = Array.isArray(c.extra) ? c.extra : [];
     const required = extra.filter((e) => e && e.isRequired).map((e) => e.name);
+    if (!isLiveType(String(c.type))) {
+      const type = String(c.type);
+      if (type !== "movie" && type !== "series" && type !== "anime") continue;
+      const name = String(c.name || c.id).replace(/\s*\((US|UK)\)/g, "").replace(VISUAL, "").trim().slice(0, 60);
+      if (!required.length) content.push({ id: String(c.id), type, name: name || String(c.id) });
+      else if (required.length === 1 && required[0] === "search" && type !== "anime") searches.push({ id: String(c.id), type });
+      continue;
+    }
     const genreExtra = extra.find((e) => e && e.name === "genre");
     catalogs.push({
       id: String(c.id),
@@ -192,17 +202,17 @@ function normalizeManifest(m) {
     });
   }
   const resources = (m.resources || []).map((r) => (typeof r === "string" ? r : r && r.name)).filter(Boolean);
-  return { catalogs: catalogs.filter((c) => c.browsable), resources };
+  return { catalogs: catalogs.filter((c) => c.browsable), content, searches, resources };
 }
 
 async function loadManifest(fresh) {
   const make = async () => normalizeManifest(await getJson("/manifest.json", 15000));
   if (fresh) return make();
   try {
-    return await stored("m1-" + hash(base()), TTL_MANIFEST, make);
+    return await stored("m2-" + hash(base()), TTL_MANIFEST, make);
   } catch (e) {
     try {
-      const stale = JSON.parse(kino.storage.get("m1-" + hash(base())) || "null");
+      const stale = JSON.parse(kino.storage.get("m2-" + hash(base())) || "null");
       if (stale && stale.v) return stale.v; // the server hiccuped: the last manifest still works
     } catch { /* nothing kept */ }
     throw e;
@@ -346,10 +356,11 @@ function itemsOf(results, kind, names) {
 }
 
 /** What `kino.meta` knows about a title by its TMDB id: the whole of its page, episodes and every id Kino has. */
-async function metaOf(kind, tmdbId) {
+async function metaOf(kind, idsOrTmdb) {
+  const ids = typeof idsOrTmdb === "object" ? idsOrTmdb : { tmdb: idsOrTmdb };
   if (typeof kino.meta !== "function") throw kino.error("unavailable", "no kino.meta", { userMessage: t("noTmdb") });
   try {
-    const answer = await kino.meta({ type: kind, ids: { tmdb: tmdbId } });
+    const answer = await kino.meta({ type: kind, ids });
     if (!answer) throw kino.error("not_found", "no meta", { userMessage: t("unknownRef") });
     return answer;
   } catch (e) {
@@ -374,21 +385,32 @@ function infoOf(meta) {
 
 export async function details(ref) {
   const r = parseRef(ref);
-  if (r.k !== "movie" || !r.t) throw kino.error("not_found", "not a movie", { userMessage: t("unknownRef") });
-  return infoOf(await metaOf("movie", r.t));
+  if (r.a) return infoOfAddon(await addonMeta(r));
+  if (r.k !== "movie" || !(r.t || r.m)) throw kino.error("not_found", "not a movie", { userMessage: t("unknownRef") });
+  return infoOf(await metaOf("movie", r.t ? r.t : { imdb: r.m }));
 }
 
 export async function episodes(ref) {
   const r = parseRef(ref);
-  if (r.k !== "series" || !r.t) throw kino.error("not_found", "not a series", { userMessage: t("unknownRef") });
-  const meta = await metaOf("series", r.t);
+  if (r.a) {
+    // The addon has no sources under a Kitsu id, only under the IMDb one: Kino's own anime mapping gives both.
+    const mapped = await metaOf("series", idsOf(r.a) || {}).catch(() => null);
+    if (mapped && Array.isArray(mapped.episodes) && mapped.episodes.length && mapped.ids && (mapped.ids.imdb || mapped.ids.tmdb)) return episodesOf(r, mapped);
+    return addonEpisodes(r);
+  }
+  if (r.k !== "series" || !(r.t || r.m)) throw kino.error("not_found", "not a series", { userMessage: t("unknownRef") });
+  return episodesOf(r, await metaOf("series", r.t ? r.t : { imdb: r.m }));
+}
+
+function episodesOf(r, meta) {
   const imdb = meta.ids && meta.ids.imdb;
+  const tmdbId = (meta.ids && meta.ids.tmdb) || r.t;
   const list = [];
   for (const ep of Array.isArray(meta.episodes) ? meta.episodes : []) {
     const season = num(ep.season);
     const number = num(ep.number);
     if (season < 1 || season > 999 || number < 1 || number > 99999) continue; // specials (season 0) have no place in Kino's numbering
-    const entry = { season, number, ref: makeRef({ k: "series", t: r.t, m: imdb || undefined, s: season, e: number }) };
+    const entry = { season, number, ref: makeRef({ k: "series", t: tmdbId || undefined, m: imdb || undefined, s: season, e: number }) };
     if (ep.title) entry.title = String(ep.title).slice(0, 200);
     const still = httpUrl(ep.still);
     if (still) entry.still = still;
@@ -400,6 +422,129 @@ export async function episodes(ref) {
   if (!list.length) throw kino.error("not_found", "no episodes", { userMessage: t("noEpisodes") });
   list.sort((a, b) => (a.season - b.season) || (a.number - b.number));
   return { series: infoOf(meta), episodes: list };
+}
+
+// ---- 5b. the addon's own catalogs ---------------------------------------------------------------------------------
+// The addon lists its catalogs in its manifest in the order its configuration chose (platforms, trending, anime...). Home,
+// the tabs and Buscar follow that list; the TMDB lists above are only the fallback when the addon gives none.
+
+/** An addon id in a path: the colons of "kitsu:12:3" stay as they are. */
+function idPath(id) {
+  return encodeURIComponent(String(id)).replace(/%3A/gi, ":");
+}
+
+/** The ids Kino knows how to link, read from an addon id ("tt123", "tmdb:603", "kitsu:1376"). */
+function idsOf(id) {
+  const raw = String(id);
+  if (/^tt\d+$/.test(raw)) return { imdb: raw };
+  const m = /^(tmdb|kitsu|mal|anilist):(\d+)$/.exec(raw);
+  return m ? { [m[1]]: parseInt(m[2], 10) } : undefined;
+}
+
+/** One addon meta as a Kino item. `catType` is the catalog's own type ("movie", "series" or "anime"). */
+function addonItem(m, catType) {
+  const id = String(m.id);
+  const title = String(m.name || "").replace(/\s+/g, " ").trim();
+  if (!id || !title || id.length > 120) return null;
+  const kind = m.type === "movie" ? "movie" : "series";
+  const ids = idsOf(id);
+  const ref = ids && ids.imdb ? { k: kind, m: id } : ids && ids.tmdb ? { k: kind, t: ids.tmdb } : { k: kind, a: id, y: catType };
+  const item = { id: safeId(id), ref: makeRef(ref), title: title.slice(0, 200), kind };
+  if (ids) item.ids = ids;
+  const y = num(String(m.releaseInfo || m.year || "").slice(0, 4));
+  if (y >= 1870 && y <= 2100) item.year = y;
+  const poster = httpUrl(m.poster);
+  if (poster) item.poster = poster;
+  const backdrop = httpUrl(m.background);
+  if (backdrop) item.backdrop = backdrop;
+  if (m.description) item.overview = String(m.description);
+  const rating = parseFloat(m.imdbRating);
+  if (rating > 0 && rating <= 10) item.rating = Math.round(rating * 10) / 10;
+  const genres = (Array.isArray(m.genres) ? m.genres : []).filter((g) => typeof g === "string" && g.trim()).map((g) => g.trim().slice(0, 30)).slice(0, 5);
+  if (genres.length) item.genres = genres;
+  return item;
+}
+
+function addonItems(metas, catType) {
+  const seen = new Set();
+  const items = [];
+  for (const m of metas) {
+    const item = m && typeof m.id === "string" ? addonItem(m, catType) : null;
+    if (!item || seen.has(item.id)) continue;
+    seen.add(item.id);
+    items.push(item);
+  }
+  return items;
+}
+
+async function addonCatalog(type, id, search) {
+  const path = `/catalog/${enc(type)}/${enc(id)}${search ? "/search=" + enc(search) : ""}.json`;
+  const data = await cachedMem(hash(base()) + path, TTL_PAGE, () => getJson(path, 15000));
+  return Array.isArray(data && data.metas) ? data.metas : [];
+}
+
+async function addonMeta(r) {
+  const path = `/meta/${enc(r.y || r.k)}/${idPath(r.a)}.json`;
+  const data = await cachedMem(hash(base()) + path, TTL_PAGE, () => getJson(path, 15000));
+  if (!data || !data.meta) throw kino.error("not_found", "no meta", { userMessage: t("unknownRef") });
+  return data.meta;
+}
+
+function infoOfAddon(meta) {
+  const genres = (Array.isArray(meta.genres) ? meta.genres : []).filter((g) => typeof g === "string").slice(0, 5);
+  return {
+    title: meta.name ? String(meta.name).slice(0, 200) : undefined,
+    poster: httpUrl(meta.poster),
+    backdrop: httpUrl(meta.background),
+    overview: meta.description ? String(meta.description) : undefined,
+    genres: genres.length ? genres : undefined,
+    year: num(String(meta.releaseInfo || meta.year || "").slice(0, 4)) || undefined,
+    ids: idsOf(meta.id),
+  };
+}
+
+async function addonEpisodes(r) {
+  const meta = await addonMeta(r);
+  const list = [];
+  for (const v of Array.isArray(meta.videos) ? meta.videos : []) {
+    const season = num(v.season) || 1;
+    const number = num(v.episode != null ? v.episode : v.number);
+    if (season < 1 || season > 999 || number < 1 || number > 99999 || !v.id) continue;
+    const entry = { season, number, ref: makeRef({ k: "series", a: r.a, y: r.y, v: String(v.id) }) };
+    if (v.title || v.name) entry.title = String(v.title || v.name).slice(0, 200);
+    const still = httpUrl(v.thumbnail);
+    if (still) entry.still = still;
+    if (v.overview) entry.overview = String(v.overview);
+    const aired = /^\d{4}-\d{2}-\d{2}/.exec(String(v.released || ""));
+    if (aired) entry.airDate = aired[0];
+    list.push(entry);
+  }
+  if (!list.length) throw kino.error("not_found", "no episodes", { userMessage: t("noEpisodes") });
+  list.sort((a, b) => (a.season - b.season) || (a.number - b.number));
+  return { series: infoOfAddon(meta), episodes: list };
+}
+
+/** A row per addon catalog that has titles, in the addon's own order; "Ver más" shows the whole catalog. */
+async function addonRows(cats) {
+  const pages = await pool(cats, 5, async (c) => addonItems(await addonCatalog(c.type, c.id), c.type));
+  const rows = [];
+  cats.forEach((c, i) => {
+    const all = pages[i] || [];
+    if (!all.length) return;
+    const row = { id: "c" + hash(c.id), title: c.name, items: all.slice(0, ROW_ITEMS) };
+    if (all.length > ROW_ITEMS) row.ref = makeRef({ k: "row", c: c.id, ty: c.type });
+    rows.push(row);
+  });
+  return rows;
+}
+
+async function addonSearch(manifest, q, wanted) {
+  const found = await pool(manifest.searches.slice(0, 4), 4, async (c) => addonItems(await addonCatalog(c.type, c.id, q), c.type));
+  const items = [];
+  const seen = new Set();
+  for (const list of found) for (const item of list || []) if (!seen.has(item.id) && seen.add(item.id)) items.push(item);
+  if (wanted) items.sort((a, b) => (a.kind === wanted ? 0 : 1) - (b.kind === wanted ? 0 : 1));
+  return items.slice(0, 40);
 }
 
 // ---- 6. rows -----------------------------------------------------------------------------------------------------
@@ -495,22 +640,33 @@ export async function home() {
   // Movies and series alternate, so a short Home shows both.
   const ordered = [];
   for (let i = 0; i < 4; i++) ordered.push(specs[i], specs[4 + i]);
-  const [rows, live] = await Promise.all([listRows(ordered.slice(0, rowsSetting())), liveHomeRows(manifest).catch(() => [])]);
+  const fromTmdb = () => listRows(ordered.slice(0, rowsSetting()));
+  const fromAddon = async () => {
+    const rows = manifest.content.length ? await addonRows(manifest.content.slice(0, rowsSetting())) : [];
+    return rows.length ? rows : fromTmdb();
+  };
+  const [rows, live] = await Promise.all([fromAddon().catch(fromTmdb), liveHomeRows(manifest).catch(() => [])]);
   return live.concat(rows);
 }
 
 // ---- the section: three tabs (movies, series, live), each with the lists above and its genres
 
 export async function section(arg) {
+  const manifest = await loadManifest(false);
   const tabs = [
     { id: "cinema", label: t("cinema") },
     { id: "series", label: t("series") },
     { id: "anime", label: t("anime") },
-    { id: "platforms", label: t("platforms") },
+    ...(manifest.content.length ? [] : [{ id: "platforms", label: t("platforms") }]),
     { id: "live", label: t("live") },
   ];
   const tab = tabs.find((x) => x.id === (arg && arg.tab)) || tabs[0];
-  if (tab.id === "live") return { tabs, tab: tab.id, rows: await liveRows(await loadManifest(false)) };
+  if (tab.id === "live") return { tabs, tab: tab.id, rows: await liveRows(manifest) };
+  const own = manifest.content.filter((c) => c.type === (tab.id === "cinema" ? "movie" : tab.id));
+  if (own.length) {
+    const rows = await addonRows(own.slice(0, 14)).catch(() => []);
+    if (rows.length) return { tabs, tab: tab.id, rows };
+  }
   if (tab.id === "anime") return { tabs, tab: tab.id, rows: await listRows(animeSpecs()) };
   if (tab.id === "platforms") return { tabs, tab: tab.id, rows: await listRows(platformSpecs()) };
   const kind = tab.id === "cinema" ? "movie" : "series";
@@ -557,6 +713,7 @@ export async function categories() {
 /** "Ver más": a page of the same TMDB list; the cursor is its page number. */
 export async function browse(ref, cursor) {
   const r = parseRef(ref);
+  if (r.c) return { items: addonItems(await addonCatalog(r.ty, r.c), r.ty) }; // the addon answers a whole catalog at once
   if (!r.e || typeof r.e !== "string") throw kino.error("not_found", "bad ref", { userMessage: t("unknownRef") });
   const kind = r.k === "movie" ? "movie" : "series";
   const page = Math.max(1, num(cursor) || 1);
@@ -568,15 +725,20 @@ export async function browse(ref, cursor) {
 export async function search(query) {
   const q = String(query.q || "").trim();
   const wanted = query.type === "movie" ? "movie" : query.type === "series" ? "tv" : null;
-  const names = await genreNames();
   // Kino looking for one title it already knows (by TMDB id): answer that title, whichever kind it is.
   if (query.tmdbId > 0) {
+    const names = await genreNames();
     const kinds = wanted === "tv" ? ["series"] : wanted === "movie" ? ["movie"] : ["movie", "series"];
     const found = await pool(kinds, 2, async (kind) => titleItem(await tmdb(kind === "movie" ? `/movie/${query.tmdbId}` : `/tv/${query.tmdbId}`), kind, names));
     const items = found.filter(Boolean);
     if (items.length) return items;
   }
   if (q.length < 2) return [];
+  try {
+    const own = await addonSearch(await loadManifest(false), q, wanted === "tv" ? "series" : wanted);
+    if (own.length) return own;
+  } catch { /* the addon's search failed: TMDB answers */ }
+  const names = await genreNames();
   const data = await tmdb("/search/multi", { query: q, include_adult: false, page: 1 });
   const items = [];
   for (const r of data.results || []) {
@@ -760,8 +922,15 @@ export async function resolve(ref) {
   let list;
   if (r.k === "tv") {
     list = await streamsOf(`/stream/tv/${enc(r.id)}.json`);
+  } else if (r.a) {
+    let imdb = "";
+    if (!r.v && r.k === "movie") {
+      const mapped = await metaOf("movie", idsOf(r.a) || {}).catch(() => null);
+      imdb = (mapped && mapped.ids && mapped.ids.imdb) || "";
+    }
+    list = await streamsOf(imdb ? `/stream/movie/${imdb}.json` : `/stream/${enc(r.y || r.k)}/${idPath(r.v || r.a)}.json`);
   } else {
-    if (!r.t) throw kino.error("not_found", "bad ref", { userMessage: t("unknownRef") });
+    if (!r.t && !r.m) throw kino.error("not_found", "bad ref", { userMessage: t("unknownRef") });
     const imdb = await imdbOf(r);
     if (!/^tt\d+$/.test(imdb)) throw kino.error("not_found", "no imdb", { userMessage: t("noImdb") });
     list = await streamsOf(r.k === "movie" ? `/stream/movie/${imdb}.json` : `/stream/series/${imdb}:${num(r.s) || 1}:${num(r.e) || 1}.json`);
