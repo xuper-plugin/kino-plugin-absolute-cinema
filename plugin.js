@@ -977,8 +977,26 @@ function streamFor(list, live) {
 
 /** The server asks its sources when a title is requested, so this one is slow (about ten seconds). */
 async function streamsOf(path) {
-  const data = await getJson(path, 18000, "warming");
-  return Array.isArray(data && data.streams) ? data.streams : [];
+  // The addon sometimes answers empty the first time and has the copies a moment later, so one retry; the two together stay
+  // inside Kino's 20 s for a resolve.
+  const started = Date.now();
+  let list = [];
+  let failure = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const left = 19000 - (Date.now() - started);
+    if (left < 3000) break;
+    try {
+      const data = await getJson(path, attempt === 0 ? Math.min(left, 9000) : left, "warming");
+      list = Array.isArray(data && data.streams) ? data.streams : [];
+      failure = null;
+      if (list.some(playable)) return list;
+    } catch (e) {
+      failure = e;
+    }
+    if (attempt === 0) await kino.sleep(1500);
+  }
+  if (failure && !list.length) throw failure;
+  return list;
 }
 
 /** The IMDb id the server asks for: the one in the ref, else what Kino knows, else what TMDB says. */
