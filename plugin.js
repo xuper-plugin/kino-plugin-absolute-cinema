@@ -7,7 +7,7 @@
 // Read it top to bottom: 1. texts  2. http  3. manifest  4. TMDB  5. titles  6. rows  7. streams  8. live  9. settings
 
 // The addon's address is the person's own (their configuration is part of it); empty means the addon's default setup.
-const DEFAULT_BASE = "https://cinema.debrid.in/mode=http|httpsources=4khdhub,moviebox,archiveorg,archiveorgdub|embeddedsubs=en,es|livetv=1|sports=1|worldnews=1";
+const DEFAULT_BASE = "https://cinema.debrid.in/mode=http|httpsources=4khdhub,moviebox,archiveorg,archiveorgdub|embeddedsubs=en,es|livetv=1|worldnews=1";
 
 /** The addon's root: what the person pasted (a manifest.json address or the root) without the manifest and the closing slash. */
 function base() {
@@ -40,6 +40,21 @@ const TEXTS = {
     offline: "Sin conexión: {detail}",
     online: "Conectado: {channels} canales en vivo",
     cinema: "Cine",
+    panelTitle: "Absolute Cinema",
+    tabCopy: "Esta copia",
+    tabSummary: "Resumen",
+    tabPrefs: "Preferencias",
+    tabError: "No se pudo cargar esta pestaña.",
+    playingNow: "Reproduciendo",
+    copyQuality: "Calidad: {v}",
+    copyNoInfo: "El reproductor aún no tiene datos de esta copia.",
+    statResolution: "Resolución: {v}",
+    statNetwork: "Red: {v}",
+    statStalls: "Cortes en esta sesión: {v}",
+    sumCast: "Reparto: {v}",
+    prefQuality: "Calidad preferida",
+    prefMaxSize: "Tamaño máximo",
+    prefApplies: "Se aplica desde la próxima reproducción; la copia actual no cambia.",
     tabHome: "Inicio",
     brWatch: "Reproducir",
     brInfo: "Más información",
@@ -87,6 +102,21 @@ const TEXTS = {
     offline: "Offline: {detail}",
     online: "Connected: {channels} live channels",
     cinema: "Movies",
+    panelTitle: "Absolute Cinema",
+    tabCopy: "This copy",
+    tabSummary: "Summary",
+    tabPrefs: "Preferences",
+    tabError: "Could not load this tab.",
+    playingNow: "Now playing",
+    copyQuality: "Quality: {v}",
+    copyNoInfo: "The player has no data on this copy yet.",
+    statResolution: "Resolution: {v}",
+    statNetwork: "Network: {v}",
+    statStalls: "Stalls this session: {v}",
+    sumCast: "Cast: {v}",
+    prefQuality: "Preferred quality",
+    prefMaxSize: "Maximum size",
+    prefApplies: "Applies from the next play; the copy that plays does not change.",
     tabHome: "Home",
     brWatch: "Play",
     brInfo: "More info",
@@ -114,6 +144,10 @@ const TEXTS = {
     onAir: "On the air",
   },
 };
+
+function fill(tpl, vars) {
+  return vars ? String(tpl).replace(/\{(\w+)\}/g, (_, k) => String(vars[k] != null ? vars[k] : "")) : tpl;
+}
 
 function t(key, vars) {
   const lang = String(kino.lang || "").toLowerCase().startsWith("es") ? "es" : "en";
@@ -852,8 +886,21 @@ function sizeGbOf(s) {
   return Number.isFinite(n) ? (m[2].toLowerCase() === "mb" ? n / 1024 : n) : undefined;
 }
 
+function readPrefOverride() {
+  try {
+    const o = JSON.parse(kino.storage.get("pp1") || "{}");
+    return o && typeof o === "object" ? o : {};
+  } catch { return {}; }
+}
+
+/** A preference the person may change from the player's panel: that choice, else the settings form's. */
+function pref(key) {
+  const o = readPrefOverride();
+  return typeof o[key] === "string" ? o[key] : String(kino.config.get(key) || "");
+}
+
 function preferredRank() {
-  const q = String(kino.config.get("quality") || "auto");
+  const q = pref("quality") || "auto";
   return QUALITY_RANK[q] || QUALITY_RANK["1080p"];
 }
 
@@ -866,7 +913,7 @@ function inMyLanguage(s) {
 
 /** The copies the person's settings allow: their language first, then the closest to the preferred quality, the lighter file among equals, then the server's order. */
 function ordered(list) {
-  const maxGb = parseFloat(String(kino.config.get("maxSize") || "0")) || 0;
+  const maxGb = parseFloat(pref("maxSize") || "0") || 0;
   let usable = list;
   if (maxGb > 0) {
     const small = list.filter((s) => { const gb = sizeGbOf(s); return gb === undefined || gb <= maxGb; });
@@ -1116,9 +1163,9 @@ const HIST_MAX = 24;
 const HTTPS = /^https:\/\//;
 
 /** A text in both languages as a node's twin fields: `{ [field]: Spanish, [field + "En"]: English }`. */
-function twin(key, field) {
+function twin(key, field, vars) {
   const f = field || "text";
-  return { [f]: TEXTS.es[key], [f + "En"]: TEXTS.en[key] };
+  return { [f]: fill(TEXTS.es[key], vars), [f + "En"]: fill(TEXTS.en[key], vars) };
 }
 
 // ---- what the screen shows, from the rows the section already builds
@@ -1471,6 +1518,146 @@ export async function screenEvent(ev) {
   return browseScreen().event(ev && typeof ev === "object" ? ev : {});
 }
 
+
+// ---- 11. the player panel ----------------------------------------------------------------------------------------
+// Three tabs while a title plays: this copy (what the player knows of it), a TMDB summary, and the two preferences worth
+// changing while watching (quality and maximum size). The panel always answers: a tab that throws or has nothing becomes one
+// status line. Preferences saved here win over the settings form (`pref`) for the next play; the copy that plays never changes.
+
+const PANEL_DEFAULT_TAB = "copy";
+const PANEL_TITLE_MAX = 60;
+const PANEL_QUALITIES = ["auto", "2160p", "1080p", "720p", "480p"];
+const PANEL_SIZES = ["0", "2", "5", "10", "20"];
+const PANEL_PREF_KEY = "pp1";
+const NETWORKS = {
+  wifi: { es: "Wi-Fi", en: "Wi-Fi" },
+  ethernet: { es: "Ethernet", en: "Ethernet" },
+  cellular: { es: "Datos móviles", en: "Mobile data" },
+  other: { es: "Otra", en: "Other" },
+};
+
+const panelText = (key, vars) => ({ type: "text", ...twin(key, "text", vars) });
+const panelStatus = (key) => ({ type: "status", ...twin(key, "text") });
+const isNum = (n) => typeof n === "number" && Number.isFinite(n);
+
+/** What the player tells of the copy that plays; never the network. */
+function copyTab(ctx) {
+  const playing = (ctx && ctx.playing) || {};
+  const stats = (ctx && ctx.stats) || {};
+  const lines = [];
+  if (playing.label) lines.push({ type: "text", text: String(playing.label).slice(0, 200), textEn: String(playing.label).slice(0, 200) });
+  if (playing.quality) lines.push(panelText("copyQuality", { v: String(playing.quality).slice(0, 40) }));
+  if (!lines.length) lines.push(panelText("copyNoInfo"));
+  const elements = [{ type: "card", ...twin("playingNow", "title"), children: lines }];
+  if (isNum(stats.width) && isNum(stats.height)) elements.push(panelText("statResolution", { v: `${stats.width}x${stats.height}` }));
+  if (stats.network && NETWORKS[stats.network]) {
+    const n = NETWORKS[stats.network];
+    elements.push({ type: "text", text: fill(TEXTS.es.statNetwork, { v: n.es }), textEn: fill(TEXTS.en.statNetwork, { v: n.en }) });
+  }
+  if (isNum(stats.stallsThisSession)) elements.push(panelText("statStalls", { v: stats.stallsThisSession }));
+  return { elements, refreshMs: 5000 };
+}
+
+/** A tiny TMDB summary: rating, genres, a short synopsis and five cast names. */
+async function summaryTab(ctx) {
+  const id = ctx && ctx.ids && ctx.ids.tmdb;
+  if (!id || ctx.kind === "live") return null;
+  const d = await tmdb(`/${ctx.kind === "episode" ? "tv" : "movie"}/${id}`, { append_to_response: "credits" });
+  if (!d) return null;
+  const col = [];
+  const head = [];
+  if (d.vote_average > 0) head.push("★ " + (Math.round(d.vote_average * 10) / 10));
+  const genres = (Array.isArray(d.genres) ? d.genres : []).map((g) => String(g.name)).slice(0, 4);
+  if (genres.length) head.push(genres.join(", "));
+  if (head.length) col.push({ type: "text", text: head.join(" · "), textEn: head.join(" · ") });
+  const overview = String(d.overview || "").trim();
+  if (overview) col.push({ type: "text", text: overview.length <= 150 ? overview : overview.slice(0, 149).trimEnd() + "…" });
+  const cast = ((d.credits && d.credits.cast) || []).map((c) => String(c.name)).slice(0, 5);
+  if (cast.length) col.push(panelText("sumCast", { v: cast.join(", ") }));
+  return col.length ? { elements: col } : null;
+}
+
+const optionLabel = (es, en) => ({ label: es, labelEn: en });
+
+function prefsTab() {
+  const quality = pref("quality") || "auto";
+  const size = pref("maxSize") || "0";
+  return {
+    elements: [
+      panelText("prefApplies"),
+      {
+        type: "select", key: "quality", scope: "plugin", autoSave: true, ...twin("prefQuality", "label"),
+        value: PANEL_QUALITIES.includes(quality) ? quality : "auto",
+        options: PANEL_QUALITIES.map((q) => (q === "auto" ? { value: q, ...optionLabel("Automática (1080p)", "Automatic (1080p)") } : { value: q, ...optionLabel(q, q) })),
+      },
+      {
+        type: "select", key: "maxSize", scope: "plugin", autoSave: true, ...twin("prefMaxSize", "label"),
+        value: PANEL_SIZES.includes(size) ? size : "0",
+        options: PANEL_SIZES.map((g) => (g === "0" ? { value: g, ...optionLabel("Sin límite", "No limit") } : { value: g, ...optionLabel(g + " GB", g + " GB") })),
+      },
+    ],
+  };
+}
+
+/** The panel's saved values win over a different stored override. Never throws. */
+function reconcilePrefs(ctx) {
+  try {
+    const v = ctx && ctx.values && ctx.values.plugin;
+    if (!v || typeof v !== "object") return;
+    const next = {};
+    if (PANEL_QUALITIES.includes(v.quality)) next.quality = v.quality;
+    if (PANEL_SIZES.includes(v.maxSize)) next.maxSize = v.maxSize;
+    if (Object.keys(next).length) kino.storage.set(PANEL_PREF_KEY, JSON.stringify(Object.assign(readPrefOverride(), next)));
+  } catch { /* the override stays as it was */ }
+}
+
+const PANEL_TABS = [
+  { id: "copy", label: "tabCopy", when: () => true, load: async (ctx) => copyTab(ctx) },
+  { id: "summary", label: "tabSummary", when: (ctx) => ctx.kind !== "live" && !!(ctx.ids && ctx.ids.tmdb) && typeof kino.tmdb === "function", load: (ctx) => summaryTab(ctx) },
+  { id: "prefs", label: "tabPrefs", when: () => true, load: async () => prefsTab() },
+];
+
+export async function panel(ctx) {
+  ctx = ctx || {};
+  reconcilePrefs(ctx);
+  const available = PANEL_TABS.filter((x) => x.when(ctx));
+  const active = available.find((x) => x.id === ctx.tab) || available.find((x) => x.id === PANEL_DEFAULT_TAB);
+  let body = null;
+  try {
+    body = await active.load(ctx);
+  } catch (e) {
+    kino.log("panel tab " + active.id + " failed: " + ((e && e.code) || "error"));
+  }
+  if (!body || !Array.isArray(body.elements)) body = { elements: [panelStatus("tabError")] };
+  const title = String(ctx.title || TEXTS.es.panelTitle).slice(0, PANEL_TITLE_MAX);
+  const out = {
+    title, titleEn: title,
+    presentation: ctx.device === "tv" ? "panel" : "modal",
+    tabs: available.map((x) => ({ id: x.id, label: TEXTS.es[x.label], labelEn: TEXTS.en[x.label] })),
+    tab: active.id,
+    elements: body.elements,
+  };
+  if (active.id === "copy" && body.refreshMs) out.refreshMs = body.refreshMs;
+  return out;
+}
+
+/** A change of a preference: kept at once for the next play and saved with the panel's values. */
+export async function panelAction(ev) {
+  try {
+    if (!ev || ev.trigger !== "change" || typeof ev.key !== "string") return null;
+    const ok = (ev.key === "quality" && PANEL_QUALITIES.includes(ev.value)) || (ev.key === "maxSize" && PANEL_SIZES.includes(ev.value));
+    if (!ok) return null;
+    kino.storage.set(PANEL_PREF_KEY, JSON.stringify(Object.assign(readPrefOverride(), { [ev.key]: ev.value })));
+    return { values: { [ev.key]: ev.value }, save: [ev.key] };
+  } catch {
+    return null;
+  }
+}
+
+/** The player's events are not used: the panel only reads what a panel call carries. */
+export async function playerEvent() {
+  return null;
+}
 
 // ---- 9. settings -------------------------------------------------------------------------------------------------
 
