@@ -40,6 +40,16 @@ const TEXTS = {
     offline: "Sin conexión: {detail}",
     online: "Conectado: {channels} canales en vivo",
     cinema: "Cine",
+    episodeN: "Episodio {n}",
+    seasonN: "Temporada {n}",
+    seasonsN: "{n} temporadas",
+    dSeriesGo: "Ver episodios",
+    dMore: "Más opciones",
+    dCreators: "Creación: {v}",
+    dDirector: "Dirección: {v}",
+    sumCastTitle: "Reparto",
+    dEpisodes: "Episodios",
+    dSimilar: "Más como esto",
     panelTitle: "Absolute Cinema",
     tabCopy: "Esta copia",
     tabSummary: "Resumen",
@@ -102,6 +112,16 @@ const TEXTS = {
     offline: "Offline: {detail}",
     online: "Connected: {channels} live channels",
     cinema: "Movies",
+    episodeN: "Episode {n}",
+    seasonN: "Season {n}",
+    seasonsN: "{n} seasons",
+    dSeriesGo: "Watch episodes",
+    dMore: "More options",
+    dCreators: "Created by: {v}",
+    dDirector: "Directed by: {v}",
+    sumCastTitle: "Cast",
+    dEpisodes: "Episodes",
+    dSimilar: "More like this",
     panelTitle: "Absolute Cinema",
     tabCopy: "This copy",
     tabSummary: "Summary",
@@ -1267,7 +1287,7 @@ const slideNode = (s) => ({
     { type: "ElevatedButton", key: "watch-" + s.id, ...twin("brWatch", "labelText"), icon: "play",
       onPressed: { go: { play: { ref: s.ref, kind: s.kind, id: s.id, title: s.title } } } },
     { type: "TextButton", key: "info-" + s.id, ...twin("brInfo", "labelText"),
-      onPressed: { go: { title: { ref: s.ref, kind: s.kind, id: s.id, title: s.title } } } },
+      onPressed: { go: { screen: { args: { open: s.ref } } } } },
   ],
 });
 
@@ -1277,7 +1297,7 @@ const hero = (slides) => (slides.length === 1 ? slideNode(slides[0]) : {
   type: "PageView", key: "hero" + slides.length, autoPlayMs: 6000, children: slides.map(slideNode),
 });
 
-const rail = (r, key) => ({ type: "titleRail", key, title: r.title, ...(r.ref ? { ref: r.ref } : {}), items: r.items, size: "medium" });
+const rail = (r, key) => ({ type: "titleRail", key, title: r.title, ...(r.ref ? { ref: r.ref } : {}), items: r.items.map(withOpen), size: "medium" });
 
 /** `data`: `{ slides, rails }` of the active tab, or null while it is not in. `pending`: a tab is still being fetched. */
 function browseView({ tab, data, pending, failed, device }) {
@@ -1349,12 +1369,12 @@ function searchView({ query, status, items, history, device }) {
     body.push({ type: "MaterialBanner", key: "searchFailed", role: "error", ...twin("brSearchFailed"), action: { ...twin("brRetry", "label"), onTap: "sretry" } });
   } else if (status === "done" && items) {
     if (items.length === 0) body.push({ type: "Text", ...twin("brNoResults"), color: "muted" });
-    else body.push({ type: "titleGrid", key: "results", columns: { compact: 3, expanded: 6 }, items: items.slice(0, SEARCH_CAP) });
+    else body.push({ type: "titleGrid", key: "results", columns: { compact: 3, expanded: 6 }, items: items.slice(0, SEARCH_CAP).map(withOpen) });
   } else if (status !== "idle") {
     body.push(gridSkeleton());
   } else if (history.length > 0) {
     body.push({ type: "Text", ...twin("brSearchedBefore"), style: "h4" });
-    body.push({ type: "titleGrid", key: "history", columns: { compact: 3, expanded: 6 }, items: history.slice(0, SEARCH_CAP) });
+    body.push({ type: "titleGrid", key: "history", columns: { compact: 3, expanded: 6 }, items: history.slice(0, SEARCH_CAP).map(withOpen) });
   }
   return {
     type: "Scaffold",
@@ -1365,6 +1385,183 @@ function searchView({ query, status, items, history, device }) {
     },
     body: { type: "SingleChildScrollView", key: "search-page", children: [{ type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
     ...(status === "loading" ? { every: { ms: 1000, event: "stick" } } : {}),
+  };
+}
+
+// ---- 10b. the title page ------------------------------------------------------------------------------------------
+// The plugin's own page for a title (route "detail"): a banner with the logo, the facts, the synopsis, the cast, the seasons
+// with their episodes and similar titles. A card, a slide or a result opens it through the item's `open` (the screen starts
+// again with `args.open`, and `open` answers `route.push`, so Back returns to the list). Kino's own page stays one press away
+// ("Más opciones": favourites, lists and downloads live there), and an episode opens Kino's page of the series with every
+// source the person has: a plugin screen cannot play a single episode by itself.
+
+const DETAIL_MAX_EPISODES = 80;
+const DETAIL_CAST = 12;
+
+/** A card's `open`: the screen restarts with `args.open` and answers by pushing the page. A live channel has no page. */
+const withOpen = (c) => (c && c.kind !== "live" && typeof c.ref === "string" && c.ref.length < 1000 ? { ...c, open: { screen: { args: { open: c.ref } } } } : c);
+
+/** The ids of a ref, in the shape `kino.meta` takes. */
+function idsOfRef(r) {
+  if (r.t) return { tmdb: r.t };
+  if (r.m) return { imdb: r.m };
+  return (r.a && idsOf(r.a)) || {};
+}
+
+function titleIdOf(r) {
+  if (r.m) return r.m;
+  if (r.t) return (r.k === "movie" ? "m" : "s") + r.t;
+  return r.a || "x";
+}
+
+function hoursOf(min) {
+  const m = num(min);
+  return m > 0 ? (m >= 60 ? `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}` : `${m} min`) : "";
+}
+
+/** What the page shows, from Kino's own answer for the title's ids and the addon's meta where Kino has nothing. */
+async function loadDetail(r) {
+  const kind = r.k === "movie" ? "movie" : "series";
+  const ids = idsOfRef(r);
+  let meta = Object.keys(ids).length ? await metaOf(kind, ids).catch(() => null) : null;
+  let am = null;
+  if (!meta && r.a) am = await addonMeta(r).catch(() => null);
+  if (!meta && !am) throw kino.error("not_found", "no meta", { userMessage: t("unknownRef") });
+  const src = meta || {};
+  const a = am || {};
+  const d = {
+    kind,
+    title: String(src.title || a.name || "").slice(0, 200),
+    overview: String(src.overview || a.description || ""),
+    year: num(src.year || String(a.releaseInfo || "").slice(0, 4)) || 0,
+    poster: httpUrl(src.poster) || httpUrl(a.poster),
+    backdrop: httpUrl(src.backdrop) || httpUrl(a.background),
+    logo: httpUrl(src.logo),
+    genres: (src.genres && src.genres.length ? src.genres : a.genres || []).filter((g) => typeof g === "string").slice(0, 5),
+    runtime: num(src.runtimeMinutes),
+    tagline: String(src.tagline || ""),
+    certification: String(src.certification || ""),
+    directors: (src.directors || []).slice(0, 3),
+    ratings: (src.ratings || []).slice(0, 3),
+    rating: parseFloat(a.imdbRating) || 0,
+    cast: (src.cast || []).slice(0, DETAIL_CAST),
+    ids: src.ids || idsOf(r.a || "") || ids,
+    episodes: [],
+  };
+  if (kind === "series") {
+    const list = Array.isArray(src.episodes) && src.episodes.length ? src.episodes : (a.videos || []).map((v) => ({ season: num(v.season) || 1, number: num(v.episode != null ? v.episode : v.number), title: v.title || v.name, overview: v.overview, still: v.thumbnail, airDate: String(v.released || "").slice(0, 10) }));
+    d.episodes = list.filter((e) => num(e.season) >= 1 && num(e.number) >= 1).slice(0, 600).map((e) => ({ s: num(e.season), n: num(e.number), title: String(e.title || "").slice(0, 120), overview: String(e.overview || "").slice(0, 200), still: httpUrl(e.still), air: /^\d{4}-\d{2}-\d{2}/.test(String(e.airDate || "")) ? String(e.airDate).slice(0, 10) : "" }));
+  }
+  // Similar titles: TMDB's own, when the title has a TMDB id; a failure just leaves them out.
+  d.similar = [];
+  const tid = d.ids && d.ids.tmdb;
+  if (tid && typeof kino.tmdb === "function") {
+    try {
+      const names = await genreNames();
+      const data = await tmdb(`/${kind === "movie" ? "movie" : "tv"}/${tid}/recommendations`);
+      d.similar = itemsOf(data.results, kind, names).slice(0, 12).map(cardOf);
+    } catch { /* no similar row */ }
+  }
+  return d;
+}
+
+const detailSkeleton = () => ({ type: "Column", key: "dskel", gap: 12, children: [heroSkeleton(), railSkeleton(1)] });
+
+/** The tap on an episode: Kino's page of the series by its ids (every source the person has), else this plugin's own. */
+function episodeGo(d, r, ep) {
+  const ids = d.ids || {};
+  if (ids.tmdb || ids.imdb) {
+    return { go: { titleByIds: { ...(ids.tmdb ? { tmdb: ids.tmdb } : {}), ...(ids.imdb ? { imdb: ids.imdb } : {}), kind: "series", season: ep.s, episode: ep.n, ...(d.year ? { year: d.year } : {}) } } };
+  }
+  return { go: { title: { ref: r.ref, kind: "series", id: r.id, title: d.title } } };
+}
+
+function episodeRow(d, r, ep) {
+  const facts = ep.air;
+  return {
+    type: "Row", key: `ep-${ep.s}-${ep.n}`, gap: 12, crossAxisAlignment: "center", onTap: episodeGo(d, r, ep),
+    children: [
+      { type: "Image", key: `epi-${ep.s}-${ep.n}`, width: 120, aspect: "16:9", fit: "cover", ...(ep.still ? { url: ep.still } : {}), fallback: { type: "Skeleton", shape: "block", height: 64 } },
+      { type: "Column", flex: 1, gap: 4, children: [
+        { type: "Text", text: `${ep.n}. ${ep.title || fill(TEXTS.es.episodeN, { n: ep.n })}`, textEn: `${ep.n}. ${ep.title || fill(TEXTS.en.episodeN, { n: ep.n })}`, bold: true, maxLines: 2 },
+        ...(facts ? [{ type: "Text", text: facts, textEn: facts, color: "muted", style: "caption" }] : []),
+        ...(ep.overview ? [{ type: "Text", text: ep.overview, color: "muted", style: "caption", maxLines: 2 }] : []),
+      ] },
+    ],
+  };
+}
+
+function castItem(c) {
+  const name = String(c.name || "").slice(0, 60);
+  const initials = name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+  return {
+    type: "Column", key: "cast-" + hash(name + (c.character || "")), width: 96, gap: 4, crossAxisAlignment: "center", children: [
+      { type: "CircleAvatar", radius: 36, ...(httpUrl(c.photo) ? { image: httpUrl(c.photo) } : {}), text: initials },
+      { type: "Text", text: name, textEn: name, style: "caption", maxLines: 2 },
+      ...(c.character ? [{ type: "Text", text: String(c.character).slice(0, 40), textEn: String(c.character).slice(0, 40), style: "caption", color: "muted", maxLines: 1 }] : []),
+    ],
+  };
+}
+
+const sectionTitle = (key) => ({ type: "Text", ...twin(key), style: "h4" });
+
+function detailView({ r, entry, season, device }) {
+  const d = entry && entry.d;
+  const appBar = {
+    type: "AppBar", mergeWithKinoBar: true, dense: true, divider: false,
+    leading: { type: "IconButton", key: "back", icon: "arrow_back", ...twin("brBack", "labelText"), ...twin("brBack", "tooltip"), onPressed: "back" },
+    title: logo(),
+  };
+  const body = [];
+  if (!entry) {
+    body.push(detailSkeleton());
+  } else if (!d) {
+    body.push({ type: "MaterialBanner", key: "detailFailed", role: "error", ...twin("brFailed"), action: { ...twin("brRetry", "label"), onTap: "dretry" } });
+  } else {
+    const series = d.kind === "series";
+    const seasons = [...new Set(d.episodes.map((e) => e.s))].sort((a, b) => a - b);
+    const shown = seasons.includes(season) ? season : seasons[0];
+    const play = series
+      ? { type: "ElevatedButton", key: "dplay", ...twin("dSeriesGo", "labelText"), icon: "play", onPressed: { go: { title: { ref: r.ref, kind: "series", id: r.id, title: d.title } } } }
+      : { type: "ElevatedButton", key: "dplay", ...twin("brWatch", "labelText"), icon: "play", onPressed: { go: { play: { ref: r.ref, kind: "movie", id: r.id, title: d.title } } } };
+    const buttons = [play];
+    if (!series) buttons.push({ type: "TextButton", key: "dmore", ...twin("dMore", "labelText"), onPressed: { go: { title: { ref: r.ref, kind: "movie", id: r.id, title: d.title } } } });
+    const lead = d.tagline || (d.overview.length <= 140 ? d.overview : d.overview.slice(0, 139).trimEnd() + "…");
+    body.push({
+      type: "heroCard", key: "dhero", h: { compact: 240, expanded: 320 }, title: d.title, text: lead, image: d.backdrop || d.poster || "",
+      ...(d.logo ? { logo: d.logo } : {}), buttons,
+    });
+    const facts = [];
+    const tmdbRating = d.ratings.find((x) => x.source === "tmdb");
+    const imdbRating = d.ratings.find((x) => x.source === "imdb");
+    if (imdbRating) facts.push("★ " + imdbRating.value);
+    else if (tmdbRating) facts.push("★ " + tmdbRating.value);
+    else if (d.rating) facts.push("★ " + d.rating);
+    if (d.year) facts.push(String(d.year));
+    if (d.certification) facts.push(d.certification);
+    if (d.runtime) facts.push(hoursOf(d.runtime));
+    const factsEs = facts.concat(series && seasons.length ? [fill(TEXTS.es.seasonsN, { n: seasons.length })] : []);
+    const factsEn = facts.concat(series && seasons.length ? [fill(TEXTS.en.seasonsN, { n: seasons.length })] : []);
+    if (factsEs.length) body.push({ type: "Text", key: "dfacts", text: factsEs.join("  ·  "), textEn: factsEn.join("  ·  "), style: "h4" });
+    if (d.genres.length) body.push({ type: "Row", key: "dgenres", gap: 8, children: d.genres.slice(0, 4).map((g) => ({ type: "Badge", text: g, textEn: g })) });
+    if (d.overview) body.push({ type: "Text", key: "dsynopsis", text: d.overview, textEn: d.overview });
+    if (d.directors.length) body.push({ type: "Text", ...twin(series ? "dCreators" : "dDirector", "text", { v: d.directors.join(", ") }), color: "muted" });
+    if (d.cast.length) {
+      body.push(sectionTitle("sumCastTitle"));
+      body.push({ type: "SingleChildScrollView", key: "dcast", direction: "horizontal", children: [{ type: "Row", gap: 12, children: d.cast.map(castItem) }] });
+    }
+    if (series && seasons.length) {
+      body.push(seasons.length > 1
+        ? { type: "DropdownButton", key: "dseason", value: String(shown), onChanged: "season", options: seasons.map((s) => ({ value: String(s), label: fill(TEXTS.es.seasonN, { n: s }), labelEn: fill(TEXTS.en.seasonN, { n: s }) })) }
+        : sectionTitle("dEpisodes"));
+      for (const ep of d.episodes.filter((e) => e.s === shown).slice(0, DETAIL_MAX_EPISODES)) body.push(episodeRow(d, r, ep));
+    }
+    if (d.similar.length) body.push({ type: "titleRail", key: "dsimilar", ...twin("dSimilar", "title"), items: d.similar.map(withOpen), size: "medium" });
+  }
+  return {
+    type: "Scaffold", appBar,
+    body: { type: "SingleChildScrollView", key: "detail-page", children: [{ type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
+    ...(!entry ? { every: { ms: 1000, event: "dtick" } } : {}),
   };
 }
 
@@ -1432,6 +1629,16 @@ function makeBrowse() {
   function view(ctx) {
     const st = ctx.state && typeof ctx.state === "object" ? ctx.state : {};
     if (ctx.route && ctx.route.name === "settings") return settingsView();
+    if (ctx.route && ctx.route.name === "detail") {
+      const ref = ctx.route.params && typeof ctx.route.params.ref === "string" ? ctx.route.params.ref : "";
+      let r = null;
+      try { r = JSON.parse(ref); } catch { r = null; }
+      if (r && typeof r.k === "string") {
+        const entry = details.get(ref) || null;
+        const season = num(st.season);
+        return detailView({ r: { ...r, ref, id: safeId(titleIdOf(r)) }, entry, season, device: ctx.device });
+      }
+    }
     if (ctx.route && ctx.route.name === "search") {
       const query = typeof st.sq === "string" ? st.sq : "";
       const items = found && found.q === query ? found.items : null;
@@ -1449,11 +1656,38 @@ function makeBrowse() {
     return data !== null;
   }
 
+  const details = new Map(); // ref -> { d } | { d: null } (failed): the pages loaded in this sandbox
+
   const events = {
-    open({ state, device }) {
+    open({ route, state, device }) {
       const tab = TAB_IDS.includes(state.tab) ? state.tab : stored() || TAB_IDS[0];
       dataOf(tab);
-      return { state: { tab, pending: needed(tab, device), failed: null } };
+      const out = { state: { tab, pending: needed(tab, device), failed: null } };
+      // A card, a slide or a result asked for a title: the page goes over the list, so Back returns to it.
+      const open = route && route.args && typeof route.args.open === "string" ? route.args.open : "";
+      if (open) { out.route = { push: "detail", params: { ref: open } }; out.state.season = null; }
+      return out;
+    },
+    // The page's timer: loads the title once, then no timer.
+    async dtick({ route }) {
+      const ref = route && route.params && typeof route.params.ref === "string" ? route.params.ref : "";
+      if (!ref || details.has(ref)) return { state: { dv: Date.now() } };
+      try {
+        details.set(ref, { d: await loadDetail(JSON.parse(ref)) });
+      } catch (e) {
+        kino.log("screen detail failed: " + ((e && e.code) || "error"));
+        details.set(ref, { d: null });
+      }
+      return { state: { dv: Date.now() } };
+    },
+    dretry({ route }) {
+      const ref = route && route.params && typeof route.params.ref === "string" ? route.params.ref : "";
+      details.delete(ref);
+      return { state: { dv: Date.now() } };
+    },
+    season({ value, arg }) {
+      const n = num(value != null ? value : arg);
+      return n > 0 ? { state: { season: n } } : null;
     },
     tab({ value, arg, state }) {
       const tab = TAB_IDS.includes(value) ? value : TAB_IDS.includes(arg) ? arg : null;
