@@ -1,7 +1,7 @@
 {
   "id": "absolute-cinema",
   "name": "Absolute Cinema",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "apiVersion": 9,
   "entry": "plugin.js",
   "description": "Películas, series, anime y TV en vivo desde un addon de Absolute Cinema (protocolo de Stremio) con fuentes HTTP directas. Los títulos vienen de TMDB; el video, del addon.",

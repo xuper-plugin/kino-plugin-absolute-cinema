@@ -1323,6 +1323,8 @@ function browseView({ tab, data, pending, failed, device }) {
   } else {
     body.push(heroSkeleton(), railSkeleton(1), railSkeleton(2), railSkeleton(3));
   }
+  const isBanner = (n) => !!n && (n.type === "heroCard" || n.key === "heroSkeleton" || (n.type === "PageView" && String(n.key).startsWith("hero")));
+  const banner = body.length > 0 && isBanner(body[0]) ? body.shift() : null; // the main picture goes edge to edge, right under the bar
   return {
     type: "Scaffold",
     appBar: {
@@ -1341,7 +1343,7 @@ function browseView({ tab, data, pending, failed, device }) {
     ...(tv ? {} : { floatingActionButton: { type: "FloatingActionButton", key: "searchFab", icon: "search", ...twin("brSearch", "tooltip"), onPressed: "openSearch" } }),
     body: { type: "Column", key: "page", children: [
       ...(tv ? [] : [{ type: "Column", key: "tabsRow", padding: { compact: 0, expanded: 24 }, children: [tabBar(active)] }]),
-      { type: "SingleChildScrollView", key: "browse-" + active, flex: 1, children: [{ type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
+      { type: "SingleChildScrollView", key: "browse-" + active, flex: 1, children: [...(banner ? [banner] : []), { type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
     ] },
     ...(pending ? { every: { ms: POLL_MS, event: "tick" } } : {}),
   };
@@ -1436,6 +1438,16 @@ function titleIdOf(r) {
   return r.a || "x";
 }
 
+/** TMDB's backdrops of a title (wide pictures), best voted first: the banner becomes a slider when there is more than one. [first] is the one Kino already gave. */
+function backdropsOf(images, first) {
+  const base = "https://image.tmdb.org/t/p/w780";
+  const list = ((images && images.backdrops) || []).filter((b) => b && typeof b.file_path === "string" && b.file_path.startsWith("/") && b.width >= 1000)
+    .sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0)).map((b) => base + b.file_path);
+  const out = [];
+  for (const u of [first, ...list]) if (u && !out.some((x) => x.slice(x.lastIndexOf("/")) === u.slice(u.lastIndexOf("/")))) out.push(u);
+  return out.slice(0, 6);
+}
+
 function hoursOf(min) {
   const m = num(min);
   return m > 0 ? (m >= 60 ? `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}` : `${m} min`) : "";
@@ -1477,6 +1489,17 @@ async function loadDetail(r) {
   // Similar titles: TMDB's own, when the title has a TMDB id; a failure just leaves them out.
   d.similar = [];
   const tid = d.ids && d.ids.tmdb;
+  // Kino's answer carries the cast as names only when TMDB has one: the photos come from TMDB's credits.
+  if (tid && typeof kino.tmdb === "function") {
+    try {
+      const credits = await tmdb(`/${kind === "movie" ? "movie" : "tv"}/${tid}/credits`);
+      const cast = ((credits && credits.cast) || []).filter((c) => c && c.name).slice(0, DETAIL_CAST).map((c) => ({ name: String(c.name), character: String(c.character || ""), photo: typeof c.profile_path === "string" && c.profile_path.startsWith("/") ? `https://image.tmdb.org/t/p/w185${c.profile_path}` : undefined }));
+      if (cast.length) d.cast = cast;
+    } catch { /* the names stay */ }
+    try {
+      d.images = backdropsOf(await tmdb(`/${kind === "movie" ? "movie" : "tv"}/${tid}/images`, { include_image_language: "null,es,en" }), d.backdrop);
+    } catch { /* the one picture stays */ }
+  }
   if (tid && typeof kino.tmdb === "function") {
     try {
       const names = await genreNames();
@@ -1503,7 +1526,7 @@ function episodeRow(d, r, ep) {
   return {
     type: "Row", key: `ep-${ep.s}-${ep.n}`, gap: 12, crossAxisAlignment: "center", onTap: episodeGo(d, r, ep),
     children: [
-      { type: "Image", key: `epi-${ep.s}-${ep.n}`, width: 120, aspect: "16:9", fit: "cover", ...(ep.still ? { url: ep.still } : {}), fallback: { type: "Skeleton", shape: "block", height: 64 } },
+      { type: "Image", key: `epi-${ep.s}-${ep.n}`, width: 120, aspect: "16:9", fit: "cover", radius: "medium", ...(ep.still ? { url: ep.still } : {}), fallback: { type: "Skeleton", shape: "block", height: 64 } },
       { type: "Column", flex: 1, gap: 4, children: [
         { type: "Text", text: `${ep.n}. ${ep.title || fill(TEXTS.es.episodeN, { n: ep.n })}`, textEn: `${ep.n}. ${ep.title || fill(TEXTS.en.episodeN, { n: ep.n })}`, bold: true, maxLines: 2 },
         ...(facts ? [{ type: "Text", text: facts, textEn: facts, color: "muted", style: "caption" }] : []),
@@ -1551,10 +1574,13 @@ function detailView({ r, entry, season, device }) {
     const buttons = [play];
     if (!series) buttons.push({ type: "TextButton", key: "dmore", ...twin("dMore", "labelText"), onPressed: { go: { title: { ref: r.ref, kind: "movie", id: r.id, title: d.title } } } });
     const lead = d.tagline || (d.overview.length <= 140 ? d.overview : d.overview.slice(0, 139).trimEnd() + "…");
-    hero = ({
-      type: "heroCard", key: "dhero", h: { compact: 240, expanded: 320 }, title: d.title, text: lead, image: d.backdrop || d.poster || "",
-      ...(d.logo ? { logo: d.logo } : {}), buttons,
+    const images = (d.images && d.images.length ? d.images : [d.backdrop || ""]).slice(0, 6);
+    const slide = (image, i) => ({
+      type: "heroCard", key: i ? "dhero-" + i : "dhero", h: { compact: 240, expanded: 320 }, title: d.title, titleEn: d.title, ...(lead ? { text: lead, textEn: lead } : {}),
+      ...(image ? { image } : {}), ...(d.logo ? { logo: d.logo } : {}), buttons: i ? buttons.map((b) => ({ ...b, key: b.key + "-" + i, autofocus: false })) : buttons,
     });
+    // The key carries the number of slides: Kino's pager keeps the count of its first drawing.
+    hero = images.length > 1 ? { type: "PageView", key: "hero" + images.length, autoPlayMs: 6000, children: images.map(slide) } : slide(images[0], 0);
     const facts = [];
     const tmdbRating = d.ratings.find((x) => x.source === "tmdb");
     const imdbRating = d.ratings.find((x) => x.source === "imdb");
