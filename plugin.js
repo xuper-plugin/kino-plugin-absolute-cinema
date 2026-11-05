@@ -1535,8 +1535,10 @@ function detailView({ r, entry, season, device }) {
     title: logo(),
   };
   const body = [];
+  let hero = null; // the banner goes edge to edge: outside the padded column
   if (!entry) {
-    body.push(detailSkeleton());
+    hero = heroSkeleton();
+    body.push(railSkeleton(1));
   } else if (!d) {
     body.push({ type: "MaterialBanner", key: "detailFailed", role: "error", ...twin("brFailed"), action: { ...twin("brRetry", "label"), onTap: "dretry" } });
   } else {
@@ -1549,7 +1551,7 @@ function detailView({ r, entry, season, device }) {
     const buttons = [play];
     if (!series) buttons.push({ type: "TextButton", key: "dmore", ...twin("dMore", "labelText"), onPressed: { go: { title: { ref: r.ref, kind: "movie", id: r.id, title: d.title } } } });
     const lead = d.tagline || (d.overview.length <= 140 ? d.overview : d.overview.slice(0, 139).trimEnd() + "…");
-    body.push({
+    hero = ({
       type: "heroCard", key: "dhero", h: { compact: 240, expanded: 320 }, title: d.title, text: lead, image: d.backdrop || d.poster || "",
       ...(d.logo ? { logo: d.logo } : {}), buttons,
     });
@@ -1585,7 +1587,7 @@ function detailView({ r, entry, season, device }) {
   }
   return {
     type: "Scaffold", appBar,
-    body: { type: "SingleChildScrollView", key: "detail-page", children: [{ type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
+    body: { type: "SingleChildScrollView", key: "detail-page", children: [...(hero ? [hero] : []), { type: "Column", padding: { compact: 12, expanded: 24 }, gap: 16, children: body }] },
     ...(!entry ? { every: { ms: 1000, event: "dtick" } } : {}),
   };
 }
