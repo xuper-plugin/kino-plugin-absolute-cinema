@@ -7,6 +7,12 @@
 // Read it top to bottom: 1. texts  2. http  3. manifest  4. TMDB  5. titles  6. rows  7. streams  8. live  9. settings
 
 // The addon's address is the person's own (their configuration is part of it); empty means the addon's default setup.
+
+// Kino waits for every request a call left running before it delivers the call's answer (quickjs-kt joins the pending async work), so a call that
+// answered early at its own deadline or guard was still held until the requests it no longer needed ended. Asking Kino to drop what a call leaves
+// running (the prelude reads this flag after every call; Kino 0.9.54 and later, an older one ignores it) lets the answer leave when it is ready.
+globalThis.__kinoDropPendingFetches = true;
+
 const DEFAULT_BASE = "https://cinema.debrid.in/mode=http|httpsources=4khdhub,moviebox,archiveorg,archiveorgdub|embeddedsubs=en,es|livetv=1|worldnews=1";
 
 /** The addon's root: what the person pasted (a manifest.json address or the root) without the manifest and the closing slash. */
@@ -744,6 +750,18 @@ function readCopy(key) {
 }
 
 /** `live()` saved under `key`; the saved copy answers when the network fails, comes back empty or takes too long. */
+/**
+ * Waits for [work] at most [ms], in short sleeps; true when it settled in time. Kino has no timers (`setTimeout` does not exist there) and its
+ * call waits for a `kino.sleep` still pending, so one long sleep, or a chain of them left behind, would hold a call that has already finished.
+ */
+async function settledWithin(ms, work) {
+  let done = false;
+  Promise.resolve(work).then(() => { done = true; }, () => { done = true; });
+  const end = Date.now() + ms;
+  while (!done && Date.now() < end) await kino.sleep(Math.min(250, Math.max(1, end - Date.now())));
+  return done;
+}
+
 async function withCopy(key, live) {
   const kept = readCopy(key);
   const fresh = live().then((rows) => {
@@ -752,9 +770,9 @@ async function withCopy(key, live) {
   });
   if (!kept) return fresh.catch(() => []);
   fresh.catch(() => {});
-  let timer;
-  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(kept), COPY_GUARD_MS); });
-  try { return await Promise.race([fresh, late]); } catch { return kept; } finally { clearTimeout(timer); }
+  // (This used `setTimeout` and `clearTimeout`, which do not exist in Kino: the `finally` threw a ReferenceError, `home thrown` on the board.)
+  if (!(await settledWithin(COPY_GUARD_MS, fresh))) return kept;
+  try { return await fresh; } catch { return kept; }
 }
 
 export function home() {
