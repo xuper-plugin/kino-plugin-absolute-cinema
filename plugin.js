@@ -718,7 +718,50 @@ function rowsSetting() {
   return n > 0 && n <= 12 ? n : 4;
 }
 
-export async function home() {
+// ---- the persistent copy of Home and of each section tab: shown when the network fails or is slow, refreshed behind
+
+const COPY_TTL = 7 * 24 * 60 * 60 * 1000;
+const COPY_MAX = 60 * 1024;
+const COPY_GUARD_MS = 12000;
+
+const copyKey = (name) => name + hash(base());
+
+function saveCopy(key, rows) {
+  if (!Array.isArray(rows) || !rows.length) return;
+  try {
+    for (let per = 20; per >= 4; per -= 4) {
+      const text = JSON.stringify({ at: Date.now(), rows: rows.map((r) => ({ ...r, items: (r.items || []).slice(0, per) })) });
+      if (text.length <= COPY_MAX) { kino.storage.set(key, text, { ttlMs: COPY_TTL }); return; }
+    }
+  } catch { /* storage full or unserializable: no copy */ }
+}
+
+function readCopy(key) {
+  try {
+    const o = JSON.parse(kino.storage.get(key) || "null");
+    return o && Array.isArray(o.rows) && o.rows.length && Date.now() - o.at < COPY_TTL ? o.rows : null;
+  } catch { return null; }
+}
+
+/** `live()` saved under `key`; the saved copy answers when the network fails, comes back empty or takes too long. */
+async function withCopy(key, live) {
+  const kept = readCopy(key);
+  const fresh = live().then((rows) => {
+    if (Array.isArray(rows) && rows.length) { saveCopy(key, rows); return rows; }
+    throw new Error("empty");
+  });
+  if (!kept) return fresh.catch(() => []);
+  fresh.catch(() => {});
+  let timer;
+  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(kept), COPY_GUARD_MS); });
+  try { return await Promise.race([fresh, late]); } catch { return kept; } finally { clearTimeout(timer); }
+}
+
+export function home() {
+  return withCopy(copyKey("home1:"), homeLive);
+}
+
+async function homeLive() {
   const manifest = await loadManifest(false);
   const specs = mainSpecs("movie").concat(mainSpecs("series"));
   // Movies and series alternate, so a short Home shows both.
@@ -737,14 +780,23 @@ export async function home() {
 
 export async function section(arg) {
   const manifest = await loadManifest(false);
-  const tabs = [
+  const tabs = tabsOf(manifest);
+  const tab = tabs.find((x) => x.id === (arg && arg.tab)) || tabs[0];
+  const rows = await withCopy(copyKey("sc1:" + tab.id + ":"), async () => (await sectionLive(manifest, tabs, tab)).rows);
+  return { tabs, tab: tab.id, rows };
+}
+
+function tabsOf(manifest) {
+  return [
     { id: "cinema", label: t("cinema") },
     { id: "series", label: t("series") },
     { id: "anime", label: t("anime") },
     ...(manifest.content.length ? [] : [{ id: "platforms", label: t("platforms") }]),
     { id: "live", label: t("live") },
   ];
-  const tab = tabs.find((x) => x.id === (arg && arg.tab)) || tabs[0];
+}
+
+async function sectionLive(manifest, tabs, tab) {
   if (tab.id === "live") return { tabs, tab: tab.id, rows: await liveRows(manifest) };
   const own = manifest.content.filter((c) => c.type === (tab.id === "cinema" ? "movie" : tab.id));
   if (own.length) {
@@ -1195,7 +1247,7 @@ const MAX_SLIDE_TEXT = 160;
 const SEARCH_CAP = 60;
 const POLL_MS = 1500;
 const SNAP_PREFIX = "br1:";
-const SNAP_TTL_MS = 12 * 3600 * 1000;
+const SNAP_TTL_MS = 7 * 24 * 3600 * 1000;
 const SNAP_MAX = 20 * 1024;
 const TAB_KEY = "browseTab";
 const HIST_KEY = "searchHist1";
@@ -1638,6 +1690,12 @@ function makeBrowse() {
       return o && Date.now() - o.at < SNAP_TTL_MS && o.data && Array.isArray(o.data.rails) ? o.data : null;
     } catch { return null; }
   }
+  /** Inicio before its own copy exists: Home's saved rows, drawn as the screen draws them. */
+  function homeSeed(tab) {
+    if (tab !== "inicio") return null;
+    const rows = readCopy(copyKey("home1:"));
+    return rows ? tabOf(rows) : null;
+  }
   function writeSnap(tab, data) {
     // Trimmed until it fits: the storage is shared with the manifest, genre and art caches.
     for (let per = 10; per >= 3; per -= 2) {
@@ -1651,7 +1709,7 @@ function makeBrowse() {
 
   function dataOf(tab) {
     if (memo.has(tab)) return memo.get(tab).data;
-    const snap = readSnap(tab);
+    const snap = readSnap(tab) || homeSeed(tab);
     if (snap) { memo.set(tab, { data: snap, whole: false }); return snap; }
     return null;
   }
