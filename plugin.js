@@ -1003,7 +1003,23 @@ function inMyLanguage(s) {
   return String(kino.lang || "").toLowerCase().startsWith("es") && SPANISH.test(`${s.name || ""} ${s.title || ""}`);
 }
 
-/** The copies the person's settings allow: their language first, then the closest to the preferred quality, the lighter file among equals, then the server's order. */
+/**
+ * How likely a copy is to play on a phone or a TV box, from what its title says: 0 = H.264 / x264 / AVC or nothing said, 1 = HEVC
+ * (x265, H.265), 2 = 10-bit, HDR / Dolby Vision, AV1 or a REMUX (a Blu-ray's untouched video: huge). A Redmi Note 9 Pro sat on
+ * "Cargando video…" for a minute on the 10-bit HEVC copy the size order put first, while the x264 one was second (2026-11-22).
+ */
+const HEAVY = /\b10[\s.-]?bit\b|\bhi10p?\b|\bhdr(10)?\b|\bdolby[\s.]?vision\b|\bdv\b|\bav1\b|\bremux\b/i;
+const HEVC = /\b(hevc|x265|h[\s.]?265)\b/i;
+const HUGE_GB = 8;
+function compatOf(s) {
+  const text = `${s.name || ""} ${s.title || ""} ${(s.behaviorHints && s.behaviorHints.filename) || ""}`;
+  return HEAVY.test(text) ? 2 : HEVC.test(text) ? 1 : 0;
+}
+
+/**
+ * The copies the person's settings allow: their language first, then the closest to the preferred quality, then the one most
+ * likely to play on this device (H.264 before HEVC before 10-bit / AV1 / REMUX), the lighter file among equals, then the server's order.
+ */
 function ordered(list) {
   const maxGb = parseFloat(pref("maxSize") || "0") || 0;
   let usable = list;
@@ -1014,8 +1030,12 @@ function ordered(list) {
   const want = preferredRank();
   const score = (s) => { const r = QUALITY_RANK[qualityOf(s)]; return r ? Math.abs(r - want) : 99; };
   return usable
-    .map((s, i) => ({ s, i, l: inMyLanguage(s) ? 0 : 1, k: score(s), gb: sizeGbOf(s) ?? 50 }))
-    .sort((a, b) => (a.l - b.l) || (a.k - b.k) || (a.gb - b.gb) || (a.i - b.i))
+    // A heavy copy (10-bit, Hi10, HDR, AV1, REMUX) goes after every copy likely to play, whatever its quality: the archive.org
+    // copies of a title say no quality at all and would otherwise wait behind three Drive copies a phone cannot open.
+    // A file over HUGE_GB is heavy too: a 10 GB 1080p MKV from a Drive "download" server sat on "Cargando video…" on a Redmi
+    // while a 546 MB archive.org MP4 of the same film was further down.
+    .map((s, i) => { const c = compatOf(s), gb = sizeGbOf(s); return { s, i, l: inMyLanguage(s) ? 0 : 1, h: c === 2 || (gb !== undefined && gb > HUGE_GB) ? 1 : 0, k: score(s), c, gb: gb ?? 50 }; })
+    .sort((a, b) => (a.l - b.l) || (a.h - b.h) || (a.k - b.k) || (a.c - b.c) || (a.gb - b.gb) || (a.i - b.i))
     .map((x) => x.s);
 }
 
@@ -1025,9 +1045,36 @@ function labelOf(s) {
   return text || undefined;
 }
 
-function streamFor(list, live) {
+/**
+ * The copies with those that answer first. The first few (in the usual order) are peeked at together (2 KB, 4 s each): one that
+ * answers keeps its place ahead, one that is slow stays after those, one that refuses or errors goes last. The addon's Google Drive
+ * copies (video-downloads.googleusercontent.com) gave a Redmi nothing at all: "Cargando video…" for minutes while the archive.org
+ * copies further down played (2026-11-22). A peek that cannot be made at all leaves the order as it was.
+ */
+const PEEK_FIRST = 4;
+async function answeringFirst(list) {
   const seen = new Set();
-  const usable = ordered(list.filter(playable).filter((s) => !seen.has(s.url) && seen.add(s.url)));
+  const order = ordered(list.filter(playable).filter((s) => !seen.has(s.url) && seen.add(s.url)));
+  const head = order.slice(0, PEEK_FIRST);
+  const verdicts = await Promise.all(head.map(async (s) => {
+    try {
+      const r = await kino.fetch(s.url, { headers: { ...(headersOf(s) || {}), Range: "bytes=0-2047" }, timeoutMs: 4000, maxBytes: 2048 });
+      return r.ok || r.status === 206 || r.status === 401 || r.status === 403 ? 0 : 2;
+    } catch (e) {
+      const code = e && e.code;
+      return code === "too_large" ? 0 : code === "timeout" ? 1 : code === "host_not_allowed" ? 0 : 2;
+    }
+  }));
+  const peeked = head.map((s, i) => ({ s, v: verdicts[i], i })).sort((a, b) => (a.v - b.v) || (a.i - b.i));
+  if (peeked.some((p) => p.v)) kino.log("copies peeked: " + peeked.map((p) => ["ok", "slow", "dead"][p.v]).join(","));
+  const good = peeked.filter((p) => p.v < 2).map((p) => p.s), dead = peeked.filter((p) => p.v === 2).map((p) => p.s);
+  return [...good, ...order.slice(PEEK_FIRST), ...dead];
+}
+
+function streamFor(list, live, inOrder = false) {
+  const seen = new Set();
+  const distinct = list.filter(playable).filter((s) => !seen.has(s.url) && seen.add(s.url));
+  const usable = inOrder ? distinct : ordered(distinct); // answeringFirst already ordered (and peeked) them
   if (!usable.length) return null;
   const taken = new Map();
   const unique = (text) => {
@@ -1120,7 +1167,7 @@ export async function resolve(ref) {
     if (!/^tt\d+$/.test(imdb)) throw kino.error("not_found", "no imdb", { userMessage: t("noImdb") });
     list = await streamsOf(r.k === "movie" ? `/stream/movie/${imdb}.json` : `/stream/series/${imdb}:${num(r.s) || 1}:${num(r.e) || 1}.json`);
   }
-  const stream = streamFor(list, r.k === "tv");
+  const stream = r.k === "tv" ? streamFor(list, true) : streamFor(await answeringFirst(list), false, true);
   if (!stream) {
     const blocked = list.some((s) => s && typeof s.url === "string" && drmBlocked(s));
     throw kino.error("unavailable", "no streams", { userMessage: t(blocked ? "drmOnly" : r.k === "tv" ? "noChannel" : "noStreams") });
